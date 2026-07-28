@@ -10,6 +10,12 @@ local unpackArgs = table.unpack or unpack
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
+local VirtualUser = game:GetService("VirtualUser")
+
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
 
 local existing = playerGui:FindFirstChild("GrowItShopHelper")
 if existing then
@@ -1411,7 +1417,7 @@ title.Size = UDim2.new(1, -286, 1, 0)
 title.Position = UDim2.fromOffset(16, 0)
 title.BackgroundTransparency = 1
 title.Font = Enum.Font.GothamBold
-title.Text = "Grow It Shop UI"
+title.Text = "Auto Buy Shop | BenJaMinX"
 title.TextColor3 = Color3.fromRGB(246, 249, 255)
 title.TextSize = 22
 title.TextXAlignment = Enum.TextXAlignment.Left
