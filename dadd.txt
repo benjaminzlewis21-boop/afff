@@ -1,0 +1,1999 @@
+-- Grow It RNG shop helper UI.
+-- Reads the game's existing shop cards and clicks their real CashBuy buttons.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local unpackArgs = table.unpack or unpack
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local existing = playerGui:FindFirstChild("GrowItShopHelper")
+if existing then
+    existing:Destroy()
+end
+
+local shops = {
+    Cave = {
+        frameName = "ForbiddenShopFrame",
+        title = "Cave Seeds",
+        kind = "seed",
+        accent = Color3.fromRGB(222, 72, 129),
+    },
+    MoonSeeds = {
+        frameName = "MoonSeedStoreFrame",
+        title = "Moon Seeds",
+        kind = "seed",
+        accent = Color3.fromRGB(128, 91, 238),
+    },
+    MoonShop = {
+        frameName = "MoonSellFrame",
+        title = "Totems",
+        kind = "structure",
+        accent = Color3.fromRGB(82, 183, 255),
+    },
+    Pets = {
+        title = "Pets",
+        kind = "pets",
+        accent = Color3.fromRGB(245, 166, 74),
+    },
+}
+
+local staticCatalog = {
+    Cave = {
+        { name = "Cursed Pumpkin", rarity = "Cursed" },
+        { name = "Soul Carrot", rarity = "Cursed" },
+        { name = "Forbidden Eggplant", rarity = "Cursed" },
+        { name = "Deathblossom", rarity = "Cursed" },
+    },
+    MoonSeeds = {
+        { name = "Galaxy Grape Seed", rarity = "Galactic" },
+        { name = "Comet Corn Seed", rarity = "Galactic" },
+        { name = "Nebula Melon Seed", rarity = "Galactic" },
+        { name = "Eclipse Fruit Seed", rarity = "Galactic" },
+    },
+    MoonShop = {
+        { name = "Lunar Size Totem", price = "$200Sp", rarity = "Galactic", category = "Totems" },
+        { name = "Lunar Sell Totem", price = "$1oc", rarity = "Galactic", category = "Totems" },
+        { name = "Celestial Totem", price = "$250oc", rarity = "Galactic", category = "Totems" },
+    },
+}
+
+local moonShopCategories = { "Totems" }
+local moonTotemWhitelist = {
+    ["Lunar Size Totem"] = true,
+    ["Lunar Sell Totem"] = true,
+    ["Celestial Totem"] = true,
+}
+local moduleCatalogCache = nil
+local autoFlags = {}
+local buyAllFlags = {
+    Cave = false,
+    MoonSeeds = false,
+    MoonShop = false,
+    Pets = false,
+}
+local rowRefs = {}
+local activeTab = "Cave"
+local statusText = "Ready"
+local lastAuto = {}
+local autoInterval = 1.35
+local isCollapsed = false
+local petState = nil
+local configFolder = "GrowItRNG"
+local configPath = configFolder .. "/ShopUI_Config.json"
+local configFallbackPath = "GrowItRNG_ShopUI_Config.json"
+
+local function trim(text)
+    text = tostring(text or "")
+    return text:match("^%s*(.-)%s*$")
+end
+
+local function canUseConfigFiles()
+    return type(readfile) == "function" and type(writefile) == "function"
+end
+
+local function configFileExists(path)
+    if type(isfile) ~= "function" then
+        return true
+    end
+    local ok, exists = pcall(isfile, path)
+    return ok and exists
+end
+
+local function readConfigText()
+    if not canUseConfigFiles() then
+        return nil
+    end
+
+    for _, path in ipairs({ configPath, configFallbackPath }) do
+        if configFileExists(path) then
+            local ok, data = pcall(readfile, path)
+            if ok and type(data) == "string" and data ~= "" then
+                return data
+            end
+        end
+    end
+
+    return nil
+end
+
+local function loadConfig()
+    local data = readConfigText()
+    if not data then
+        return {}
+    end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(data)
+    end)
+
+    if ok and type(decoded) == "table" then
+        return decoded
+    end
+
+    return {}
+end
+
+local loadedConfig = loadConfig()
+
+local function copyBooleanMap(source, allowedKeys)
+    local result = {}
+    if type(source) ~= "table" then
+        return result
+    end
+
+    if allowedKeys then
+        for key in pairs(allowedKeys) do
+            if type(source[key]) == "boolean" then
+                result[key] = source[key]
+            end
+        end
+    else
+        for key, enabled in pairs(source) do
+            if type(key) == "string" and type(enabled) == "boolean" then
+                result[key] = enabled
+            end
+        end
+    end
+
+    return result
+end
+
+local function applyConfig(config)
+    if type(config) ~= "table" then
+        return
+    end
+
+    if type(config.activeTab) == "string" and shops[config.activeTab] then
+        activeTab = config.activeTab
+    end
+
+    if type(config.isCollapsed) == "boolean" then
+        isCollapsed = config.isCollapsed
+    end
+
+    for key, enabled in pairs(copyBooleanMap(config.autoFlags)) do
+        autoFlags[key] = enabled
+    end
+
+    for key, enabled in pairs(copyBooleanMap(config.buyAllFlags, buyAllFlags)) do
+        buyAllFlags[key] = enabled
+    end
+
+    if petState then
+        if type(config.petDropdownOpen) == "boolean" then
+            petState.dropdownOpen = config.petDropdownOpen
+        end
+
+        if type(config.selectedPets) == "table" then
+            petState.selectedPets = copyBooleanMap(config.selectedPets)
+            for key in pairs(autoFlags) do
+                if key:find("^PET::") then
+                    autoFlags[key] = false
+                end
+            end
+            for petName, enabled in pairs(petState.selectedPets) do
+                autoFlags["PET::" .. petName] = enabled
+            end
+        end
+    end
+end
+
+local function makeConfigFolder()
+    if type(makefolder) ~= "function" then
+        return false
+    end
+
+    if type(isfolder) == "function" then
+        local ok, exists = pcall(isfolder, configFolder)
+        if ok and exists then
+            return true
+        end
+    end
+
+    local ok = pcall(makefolder, configFolder)
+    return ok
+end
+
+local function saveConfig()
+    if not canUseConfigFiles() then
+        return false
+    end
+
+    local selectedPets = {}
+    if petState and type(petState.selectedPets) == "table" then
+        selectedPets = copyBooleanMap(petState.selectedPets)
+    end
+
+    local payload = {
+        activeTab = activeTab,
+        isCollapsed = isCollapsed,
+        petDropdownOpen = petState and petState.dropdownOpen == true or false,
+        autoFlags = copyBooleanMap(autoFlags),
+        buyAllFlags = copyBooleanMap(buyAllFlags, buyAllFlags),
+        selectedPets = selectedPets,
+    }
+
+    local encodedOk, encoded = pcall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+    if not encodedOk then
+        return false
+    end
+
+    makeConfigFolder()
+    local ok = pcall(writefile, configPath, encoded)
+    if not ok then
+        ok = pcall(writefile, configFallbackPath, encoded)
+    end
+
+    return ok
+end
+
+applyConfig(loadedConfig)
+
+local function getText(object)
+    if object and (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+        return trim(object.Text)
+    end
+    return ""
+end
+
+local function findDeep(root, name)
+    if not root then
+        return nil
+    end
+    return root:FindFirstChild(name, true)
+end
+
+local function isRealCard(card)
+    if not card:IsA("GuiObject") then
+        return false
+    end
+    if card.Name == "CardTemplate" then
+        return false
+    end
+    return card:FindFirstChild("Panel") ~= nil
+end
+
+local function getCardInfo(card)
+    local panel = card:FindFirstChild("Panel")
+    local header = panel and panel:FindFirstChild("HeaderRow")
+    if not header then
+        return nil
+    end
+
+    local name = getText(header:FindFirstChild("Name"))
+    if name == "" then
+        return nil
+    end
+
+    local expanded = panel:FindFirstChild("ExpandedRow")
+    local cashBuy = expanded and expanded:FindFirstChild("CashBuy")
+    local rarityPill = header:FindFirstChild("RarityPill")
+
+    return {
+        card = card,
+        name = name,
+        stock = getText(header:FindFirstChild("Stock")),
+        price = getText(header:FindFirstChild("Price")),
+        rarity = getText(rarityPill and rarityPill:FindFirstChild("Label")),
+        cashBuy = cashBuy,
+    }
+end
+
+local function compactPrice(value)
+    if value == nil or value == "" then
+        return ""
+    end
+    local text = tostring(value)
+    if text:sub(1, 1) == "$" then
+        return text
+    end
+    return "$" .. text
+end
+
+local function getAnyField(record, names)
+    if type(record) ~= "table" then
+        return nil
+    end
+    for _, name in ipairs(names) do
+        local value = record[name]
+        if value ~= nil then
+            return value
+        end
+    end
+    return nil
+end
+
+local function recordText(key, record)
+    local parts = { tostring(key or "") }
+    if type(record) == "table" then
+        for field, value in pairs(record) do
+            local valueType = typeof(value)
+            if valueType == "string" or valueType == "number" or valueType == "boolean" then
+                table.insert(parts, tostring(field))
+                table.insert(parts, tostring(value))
+            end
+        end
+    else
+        table.insert(parts, tostring(record or ""))
+    end
+    return string.lower(table.concat(parts, " "))
+end
+
+local function textHasAny(text, keywords)
+    for _, keyword in ipairs(keywords) do
+        if text:find(keyword, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function classifyCatalogItem(shopKey, info, sourceText)
+    local nameText = string.lower(info.name or "")
+    local text = sourceText .. " " .. nameText
+
+    if shopKey == "Cave" then
+        return textHasAny(text, {
+            "cave",
+            "cursed",
+            "forbidden",
+            "deathblossom",
+            "soul carrot",
+            "cursed pumpkin",
+        })
+    end
+
+    if shopKey == "MoonSeeds" then
+        if nameText:find("bed", 1, true) or nameText:find("totem", 1, true) then
+            return false
+        end
+        return textHasAny(text, {
+            "moon",
+            "galactic",
+            "galaxy",
+            "comet",
+            "nebula",
+            "eclipse",
+            "lunar",
+            "stardust",
+            "stellar",
+        })
+    end
+
+    if shopKey == "MoonShop" then
+        if not moonTotemWhitelist[info.name or ""] then
+            return false
+        end
+
+        if info.category and info.category ~= "" then
+            return info.category == "Totems"
+        end
+
+        return textHasAny(text, {
+            "totem",
+            "moon totem",
+            "galactic totem",
+        }) and not nameText:find("seed", 1, true)
+    end
+
+    return false
+end
+
+local function shouldIncludeShopItem(shopKey, info)
+    if shopKey == "MoonShop" then
+        return moonTotemWhitelist[info.name or ""] == true
+    end
+    return true
+end
+
+local function readCatalogFromModules()
+    if moduleCatalogCache then
+        return moduleCatalogCache
+    end
+
+    local catalog = {
+        Cave = {},
+        MoonSeeds = {},
+        MoonShop = {},
+    }
+
+    local modulesFolder = ReplicatedStorage:FindFirstChild("Modules")
+    local moduleSpecs = {
+        { folder = ReplicatedStorage, name = "SeedData" },
+        { folder = modulesFolder, name = "SeedData" },
+        { folder = modulesFolder, name = "BedData", category = "Beds" },
+        { folder = modulesFolder, name = "SellTableData", category = "Tables" },
+        { folder = modulesFolder, name = "TotemData", category = "Totems" },
+        { folder = modulesFolder, name = "DecorationData", category = "Decorations" },
+        { folder = modulesFolder, name = "GearData", category = "Gear" },
+    }
+
+    local visited = {}
+    local moduleCategory = nil
+    local function harvest(key, value, depth)
+        if depth > 3 or type(value) ~= "table" then
+            return
+        end
+        if visited[value] then
+            return
+        end
+        visited[value] = true
+
+        local rawName = getAnyField(value, { "Name", "DisplayName", "ItemName", "SeedName", "CropName", "ModelName" })
+        local name = trim(rawName or (type(key) == "string" and key or ""))
+        local sourceText = recordText(key, value)
+
+        if name ~= "" and #name <= 64 then
+            local info = {
+                name = name,
+                stock = "Server stock check",
+                price = compactPrice(getAnyField(value, { "Price", "Cost", "CashPrice", "CashCost", "BasePrice" })),
+                rarity = trim(getAnyField(value, { "Rarity", "Tier", "Category" }) or ""),
+                category = moduleCategory,
+                source = "Module",
+                order = 5000,
+            }
+
+            for shopKey in pairs(catalog) do
+                if classifyCatalogItem(shopKey, info, sourceText) then
+                    table.insert(catalog[shopKey], info)
+                end
+            end
+        end
+
+        for childKey, childValue in pairs(value) do
+            if type(childValue) == "table" then
+                harvest(childKey, childValue, depth + 1)
+            end
+        end
+    end
+
+    for _, spec in ipairs(moduleSpecs) do
+        local moduleScript = spec.folder and spec.folder:FindFirstChild(spec.name)
+        if moduleScript and moduleScript:IsA("ModuleScript") then
+            local ok, data = pcall(require, moduleScript)
+            if ok then
+                visited = {}
+                moduleCategory = spec.category
+                harvest(spec.name, data, 0)
+            end
+        end
+    end
+
+    moduleCatalogCache = catalog
+    return moduleCatalogCache
+end
+
+local function addCatalogItem(list, byName, info, order)
+    if not info or not info.name or info.name == "" then
+        return
+    end
+
+    local existingInfo = byName[info.name]
+    if existingInfo then
+        existingInfo.card = existingInfo.card or info.card
+        existingInfo.cashBuy = existingInfo.cashBuy or info.cashBuy
+        existingInfo.stock = info.stock ~= "" and info.stock or existingInfo.stock
+        existingInfo.price = info.price ~= "" and info.price or existingInfo.price
+        existingInfo.rarity = info.rarity ~= "" and info.rarity or existingInfo.rarity
+        existingInfo.category = existingInfo.category or info.category
+        existingInfo.source = existingInfo.source or info.source
+        existingInfo.order = math.min(existingInfo.order or order, order)
+        return
+    end
+
+    info.stock = info.stock or "Server stock check"
+    info.price = info.price or ""
+    info.rarity = info.rarity or ""
+    info.category = info.category or ""
+    info.source = info.source or "Catalog"
+    info.order = order
+    byName[info.name] = info
+    table.insert(list, info)
+end
+
+local function triggerButton(button)
+    if not button then
+        return false
+    end
+
+    local fired = false
+    if type(firesignal) == "function" then
+        pcall(function()
+            firesignal(button.Activated)
+            fired = true
+        end)
+        pcall(function()
+            firesignal(button.MouseButton1Click)
+            fired = true
+        end)
+    end
+
+    if not fired and type(getconnections) == "function" then
+        for _, signal in ipairs({ button.Activated, button.MouseButton1Click }) do
+            local ok, connections = pcall(getconnections, signal)
+            if ok and connections then
+                for _, connection in ipairs(connections) do
+                    pcall(function()
+                        if connection.Fire then
+                            connection:Fire()
+                        elseif connection.Function then
+                            connection.Function()
+                        end
+                    end)
+                    fired = true
+                end
+            end
+        end
+    end
+
+    return fired
+end
+
+local function getShopItemList(shopKey)
+    local shop = shops[shopKey]
+    if not shop then
+        return nil
+    end
+
+    local screenGui = playerGui:FindFirstChild("ScreenGui")
+    local frame = screenGui and screenGui:FindFirstChild(shop.frameName)
+    return frame and frame:FindFirstChild("ItemList", true), frame
+end
+
+local function selectMoonShopCategory(category)
+    local _, frame = getShopItemList("MoonShop")
+    local categoryPanel = frame and frame:FindFirstChild("CategoryPanel", true)
+    local button = categoryPanel and categoryPanel:FindFirstChild(category)
+    if triggerButton(button) and task and task.wait then
+        task.wait(0.08)
+    end
+end
+
+local function scanVisibleShopCards(shopKey, category, orderOffset)
+    local cards = {}
+    local itemList = getShopItemList(shopKey)
+    if itemList then
+        for _, child in ipairs(itemList:GetChildren()) do
+            if isRealCard(child) then
+                local info = getCardInfo(child)
+                if info then
+                    local order = (orderOffset or 0) + (tonumber(child.Name:match("Card_(%d+)")) or #cards + 1)
+                    info.category = category or info.category
+                    info.source = "Game UI"
+                    info.order = order
+                    if shouldIncludeShopItem(shopKey, info) then
+                        table.insert(cards, info)
+                    end
+                end
+            end
+        end
+    end
+
+    return cards
+end
+
+local function scanShop(shopKey)
+    local shop = shops[shopKey]
+    if not shop then
+        return {}
+    end
+
+    local cards = {}
+    local byName = {}
+
+    if shopKey == "MoonShop" then
+        for categoryIndex, category in ipairs(moonShopCategories) do
+            selectMoonShopCategory(category)
+            for _, info in ipairs(scanVisibleShopCards(shopKey, category, categoryIndex * 100)) do
+                addCatalogItem(cards, byName, info, info.order or (#cards + 1))
+            end
+        end
+    else
+        for _, info in ipairs(scanVisibleShopCards(shopKey, nil, 0)) do
+            addCatalogItem(cards, byName, info, info.order or (#cards + 1))
+        end
+    end
+
+    for index, info in ipairs(staticCatalog[shopKey] or {}) do
+        local item = {
+            name = info.name,
+            stock = "Server stock check",
+            price = info.price or "",
+            rarity = info.rarity or "",
+            category = info.category,
+            source = "Built-in",
+        }
+        if shouldIncludeShopItem(shopKey, item) then
+            addCatalogItem(cards, byName, item, 1000 + index)
+        end
+    end
+
+    for index, info in ipairs((readCatalogFromModules()[shopKey]) or {}) do
+        if shouldIncludeShopItem(shopKey, info) then
+            addCatalogItem(cards, byName, info, 2000 + index)
+        end
+    end
+
+    table.sort(cards, function(a, b)
+        local ai = a.order or 9999
+        local bi = b.order or 9999
+        if ai == bi then
+            return a.name < b.name
+        end
+        return ai < bi
+    end)
+
+    return cards
+end
+
+local function inStock(stock)
+    stock = string.lower(stock or "")
+    if stock == "" then
+        return true
+    end
+    return not stock:find("out of stock", 1, true)
+end
+
+local function setStatus(text)
+    statusText = tostring(text or "")
+    if rowRefs.StatusLabel then
+        rowRefs.StatusLabel.Text = statusText
+    end
+end
+
+local function fireGuiButton(button)
+    if not button then
+        return false, "No buy button"
+    end
+
+    local fired = false
+
+    if type(firesignal) == "function" then
+        pcall(function()
+            firesignal(button.Activated)
+            fired = true
+        end)
+        pcall(function()
+            firesignal(button.MouseButton1Click)
+            fired = true
+        end)
+    end
+
+    if not fired and type(getconnections) == "function" then
+        for _, signal in ipairs({ button.Activated, button.MouseButton1Click }) do
+            local ok, connections = pcall(getconnections, signal)
+            if ok and connections then
+                for _, connection in ipairs(connections) do
+                    pcall(function()
+                        if connection.Fire then
+                            connection:Fire()
+                        elseif connection.Function then
+                            connection.Function()
+                        end
+                    end)
+                    fired = true
+                end
+            end
+        end
+    end
+
+    return fired, fired and "Clicked" or "Executor cannot fire GUI signal"
+end
+
+local function callRemote(remote, ...)
+    if not remote then
+        return false
+    end
+
+    if remote:IsA("RemoteFunction") then
+        local ok = pcall(function(...)
+            remote:InvokeServer(...)
+        end, ...)
+        return ok
+    end
+
+    if remote:IsA("RemoteEvent") then
+        local ok = pcall(function(...)
+            remote:FireServer(...)
+        end, ...)
+        return ok
+    end
+
+    return false
+end
+
+local function fallbackBuy(kind, itemName, category)
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remotes then
+        return false, "No Remotes folder"
+    end
+
+    local cleanSeed = itemName:gsub("%s+[Ss]eed$", "")
+    if kind == "structure" then
+        local buyStructure = remotes:FindFirstChild("BuyStructure")
+        local attempts = {
+            { itemName },
+            { itemName, 1 },
+        }
+
+        if category and category ~= "" then
+            table.insert(attempts, 1, { category, itemName })
+            table.insert(attempts, 2, { itemName, category })
+            table.insert(attempts, { category, itemName, 1 })
+            table.insert(attempts, { itemName, category, 1 })
+        end
+
+        for _, args in ipairs(attempts) do
+            if callRemote(buyStructure, unpackArgs(args)) then
+                return true, "Sent BuyStructure"
+            end
+        end
+
+        return false, "BuyStructure fallback failed"
+    end
+
+    local buySeedRequest = remotes:FindFirstChild("BuySeedRequest")
+    local buySeed = remotes:FindFirstChild("BuySeed")
+    local attempts = {
+        { buySeedRequest, itemName },
+        { buySeedRequest, cleanSeed },
+        { buySeedRequest, itemName, 1 },
+        { buySeedRequest, cleanSeed, 1 },
+        { buySeed, itemName },
+        { buySeed, cleanSeed },
+        { buySeed, itemName, 1 },
+        { buySeed, cleanSeed, 1 },
+    }
+
+    for _, attempt in ipairs(attempts) do
+        local remote = attempt[1]
+        if callRemote(remote, attempt[2], attempt[3]) then
+            return true, "Sent seed remote"
+        end
+    end
+
+    return false, "Seed fallback failed"
+end
+
+local function findCurrentItem(shopKey, itemName)
+    for _, info in ipairs(scanShop(shopKey)) do
+        if info.name == itemName then
+            return info
+        end
+    end
+    return nil
+end
+
+local function findVisibleItem(shopKey, itemName, category)
+    for _, info in ipairs(scanVisibleShopCards(shopKey, category, 0)) do
+        if info.name == itemName then
+            return info
+        end
+    end
+    return nil
+end
+
+local function buyItem(shopKey, itemName, silent)
+    local shop = shops[shopKey]
+    local info = findCurrentItem(shopKey, itemName)
+    if not shop or not info then
+        if not silent then
+            setStatus(itemName .. " not found in catalog.")
+        end
+        return false
+    end
+
+    if shopKey == "MoonShop" and info.category and info.category ~= "" then
+        selectMoonShopCategory(info.category)
+        local visibleInfo = findVisibleItem(shopKey, itemName, info.category)
+        if visibleInfo then
+            info.card = visibleInfo.card
+            info.cashBuy = visibleInfo.cashBuy
+            info.stock = visibleInfo.stock
+            info.price = visibleInfo.price
+            info.rarity = visibleInfo.rarity
+        end
+    end
+
+    local clicked, clickMessage = fireGuiButton(info.cashBuy)
+    if clicked then
+        if not silent then
+            setStatus("Sent buy attempt: " .. itemName)
+        end
+        return true
+    end
+
+    local remoteOk, remoteMessage = fallbackBuy(shop.kind, itemName, info.category)
+    if not silent then
+        setStatus(remoteOk and ("Sent buy attempt: " .. itemName) or (clickMessage .. " / " .. remoteMessage))
+    end
+    return remoteOk
+end
+
+petState = {
+    selectedPets = {},
+    dropdownOpen = false,
+    target = nil,
+    prompt = nil,
+    lastScan = 0,
+    lastMove = 0,
+    lastPrompt = 0,
+    lastStatus = 0,
+    scanInterval = 1.25,
+    moveInterval = 0.08,
+    promptInterval = 0.12,
+    behindDistance = 2.5,
+}
+applyConfig(loadedConfig)
+
+local petCatalogCache = nil
+local petWantedBaseName = "Galactic Lion"
+local petWantedBaseLower = string.lower(petWantedBaseName)
+
+local function petNameMatchesTarget(name)
+    local text = string.lower(trim(name or ""))
+    if text == "" then
+        return false
+    end
+
+    if text == petWantedBaseLower then
+        return true
+    end
+
+    if text:find(petWantedBaseLower, 1, true) then
+        return true
+    end
+
+    return text:find("galactic", 1, true) ~= nil and text:find("lion", 1, true) ~= nil
+end
+
+local function getInstanceTextDump(instance)
+    local parts = { string.lower(instance.Name or "") }
+
+    local ok, attrs = pcall(function()
+        return instance:GetAttributes()
+    end)
+    if ok and type(attrs) == "table" then
+        for key, value in pairs(attrs) do
+            table.insert(parts, string.lower(tostring(key)))
+            table.insert(parts, string.lower(tostring(value)))
+        end
+    end
+
+    for _, descendant in ipairs(instance:GetDescendants()) do
+        table.insert(parts, string.lower(descendant.Name or ""))
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") or descendant:IsA("TextBox") then
+            local okText, text = pcall(function()
+                return descendant.Text
+            end)
+            if okText then
+                table.insert(parts, string.lower(tostring(text)))
+            end
+        elseif descendant:IsA("ValueBase") then
+            local okValue, value = pcall(function()
+                return descendant.Value
+            end)
+            if okValue then
+                table.insert(parts, string.lower(tostring(value)))
+            end
+        end
+    end
+
+    return table.concat(parts, " ")
+end
+
+local function petModelIsDesiredVariant(model)
+    if not model or not petNameMatchesTarget(model.Name) then
+        return false
+    end
+
+    local text = getInstanceTextDump(model)
+    return text:find("immortal", 1, true) ~= nil and text:find("golden", 1, true) ~= nil
+end
+
+local function getCharacterRoot()
+    local character = player.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function normalizeRarity(value)
+    local text = trim(value or "")
+    if text == "" then
+        return "Unknown"
+    end
+    return text
+end
+
+local function getInstanceRarity(instance)
+    for _, attr in ipairs({ "Rarity", "Tier", "PetRarity" }) do
+        local value = instance:GetAttribute(attr)
+        if value ~= nil then
+            return normalizeRarity(value)
+        end
+    end
+
+    for _, childName in ipairs({ "Rarity", "Tier", "PetRarity" }) do
+        local child = instance:FindFirstChild(childName)
+        if child and child:IsA("ValueBase") then
+            return normalizeRarity(child.Value)
+        end
+    end
+
+    return ""
+end
+
+local function addPetCatalogEntry(catalog, byName, raritySet, info)
+    if not info or not info.name or info.name == "" then
+        return
+    end
+
+    local existingInfo = byName[info.name]
+    if existingInfo then
+        if info.rarity and info.rarity ~= "" and existingInfo.rarity == "Unknown" then
+            existingInfo.rarity = info.rarity
+        end
+        return
+    end
+
+    info.rarity = normalizeRarity(info.rarity)
+    byName[info.name] = info
+    raritySet[info.rarity] = true
+    table.insert(catalog, info)
+end
+
+local function readPetCatalog()
+    if petCatalogCache then
+        return petCatalogCache
+    end
+
+    local catalog = {}
+    local byName = {}
+    local raritySet = {}
+    local petsFolder = ReplicatedStorage:FindFirstChild("Models") and ReplicatedStorage.Models:FindFirstChild("Pets")
+
+    if petsFolder then
+        for _, pet in ipairs(petsFolder:GetChildren()) do
+            if petNameMatchesTarget(pet.Name) then
+                addPetCatalogEntry(catalog, byName, raritySet, {
+                    name = pet.Name,
+                    rarity = getInstanceRarity(pet) ~= "" and getInstanceRarity(pet) or "Unknown",
+                    template = pet,
+                })
+            end
+        end
+    end
+
+    local modulesFolder = ReplicatedStorage:FindFirstChild("Modules")
+    local petModule = modulesFolder and modulesFolder:FindFirstChild("PetData")
+    if petModule and petModule:IsA("ModuleScript") then
+        local ok, data = pcall(require, petModule)
+        if ok and type(data) == "table" then
+            local visited = {}
+            local function harvest(key, value, depth)
+                if depth > 4 or type(value) ~= "table" or visited[value] then
+                    return
+                end
+                visited[value] = true
+
+                local rawName = getAnyField(value, { "Name", "DisplayName", "PetName", "ModelName" })
+                local name = trim(rawName or (type(key) == "string" and key or ""))
+                local rarity = normalizeRarity(getAnyField(value, { "Rarity", "Tier", "PetRarity" }))
+
+                if name ~= "" and petNameMatchesTarget(name) and byName[name] then
+                    byName[name].rarity = rarity
+                    raritySet[rarity] = true
+                elseif name ~= "" and petNameMatchesTarget(name) and petsFolder and petsFolder:FindFirstChild(name) then
+                    addPetCatalogEntry(catalog, byName, raritySet, {
+                        name = name,
+                        rarity = rarity,
+                        template = petsFolder:FindFirstChild(name),
+                    })
+                end
+
+                for childKey, childValue in pairs(value) do
+                    if type(childValue) == "table" then
+                        harvest(childKey, childValue, depth + 1)
+                    end
+                end
+            end
+
+            harvest("PetData", data, 0)
+        end
+    end
+
+    table.sort(catalog, function(a, b)
+        if a.rarity == b.rarity then
+            return a.name < b.name
+        end
+        return a.rarity < b.rarity
+    end)
+
+    local rarities = {}
+    for rarity in pairs(raritySet) do
+        table.insert(rarities, rarity)
+    end
+    table.sort(rarities)
+
+    petCatalogCache = {
+        list = catalog,
+        byName = byName,
+        rarities = rarities,
+    }
+    return petCatalogCache
+end
+
+local function petSelectionCount()
+    local count = 0
+    for _, enabled in pairs(petState.selectedPets) do
+        if enabled then
+            count += 1
+        end
+    end
+    return count
+end
+
+local function setPetSelected(petName, enabled)
+    if enabled then
+        petState.selectedPets = { [petName] = true }
+    else
+        petState.selectedPets = {}
+    end
+    petState.target = nil
+    petState.prompt = nil
+    petState.targetInfo = nil
+
+    if enabled then
+        buyAllFlags.Pets = true
+    else
+        buyAllFlags.Pets = false
+    end
+end
+
+local function petSelected(info)
+    return info and petState.selectedPets[info.name] == true
+end
+
+local function getPetInfoForModelName(modelName, catalog)
+    local direct = catalog.byName[modelName]
+    if direct then
+        return direct
+    end
+
+    local lowerName = string.lower(modelName)
+    for _, info in ipairs(catalog.list) do
+        local petName = string.lower(info.name)
+        if lowerName == petName or lowerName:find(petName, 1, true) then
+            return info
+        end
+    end
+
+    if petNameMatchesTarget(modelName) and #catalog.list > 0 then
+        return catalog.list[1]
+    end
+
+    return nil
+end
+
+local function getModelPart(model)
+    if not model then
+        return nil
+    end
+    return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getModelPivot(model)
+    local ok, pivot = pcall(function()
+        return model:GetPivot()
+    end)
+    if ok then
+        return pivot
+    end
+
+    local part = getModelPart(model)
+    return part and part.CFrame or nil
+end
+
+local function findPrompt(container)
+    if not container then
+        return nil
+    end
+
+    for _, descendant in ipairs(container:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") and descendant.Enabled ~= false then
+            return descendant
+        end
+    end
+
+    return nil
+end
+
+local function getPromptPart(prompt)
+    local current = prompt and prompt.Parent
+    while current do
+        if current:IsA("BasePart") then
+            return current
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+local function getPromptCFrame(prompt, fallbackModel)
+    local part = getPromptPart(prompt)
+    if part then
+        return part.CFrame
+    end
+    return getModelPivot(fallbackModel)
+end
+
+local function addPetTarget(targets, seen, model, prompt, info)
+    if not model or seen[model] or not prompt or not info then
+        return
+    end
+
+    local pivot = getPromptCFrame(prompt, model)
+    if not pivot then
+        return
+    end
+
+    seen[model] = true
+    table.insert(targets, {
+        model = model,
+        prompt = prompt,
+        info = info,
+        pivot = pivot,
+    })
+end
+
+local function scanPetTargets()
+    local catalog = readPetCatalog()
+    if petSelectionCount() == 0 then
+        return {}
+    end
+
+    local targets = {}
+    local seen = {}
+    local root = workspace:FindFirstChild("PetsRuntime")
+    if not root then
+        return {}
+    end
+
+    for _, descendant in ipairs(root:GetDescendants()) do
+        if descendant:IsA("Model") then
+            local info = getPetInfoForModelName(descendant.Name, catalog)
+            if petSelected(info) and petModelIsDesiredVariant(descendant) then
+                addPetTarget(targets, seen, descendant, findPrompt(descendant), info)
+            end
+        elseif descendant:IsA("ProximityPrompt") then
+            local ancestor = descendant.Parent
+            while ancestor and ancestor ~= root do
+                if ancestor:IsA("Model") then
+                    local info = getPetInfoForModelName(ancestor.Name, catalog)
+                    if petSelected(info) and petModelIsDesiredVariant(ancestor) then
+                        addPetTarget(targets, seen, ancestor, descendant, info)
+                        break
+                    end
+                end
+                ancestor = ancestor.Parent
+            end
+        end
+    end
+
+    local root = getCharacterRoot()
+    if root then
+        table.sort(targets, function(a, b)
+            return (a.pivot.Position - root.Position).Magnitude < (b.pivot.Position - root.Position).Magnitude
+        end)
+    end
+
+    return targets
+end
+
+local function firePetPrompt(prompt)
+    if not prompt then
+        return false
+    end
+
+    pcall(function()
+        prompt.Enabled = true
+        prompt.RequiresLineOfSight = false
+        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 100)
+        prompt.HoldDuration = 0
+    end)
+
+    local fired = false
+    if type(fireproximityprompt) == "function" then
+        fired = pcall(fireproximityprompt, prompt)
+        if not fired then
+            fired = pcall(fireproximityprompt, prompt, 0)
+        end
+        if not fired then
+            fired = pcall(fireproximityprompt, prompt, 1, true)
+        end
+    end
+
+    local ok = pcall(function()
+        prompt:InputHoldBegin()
+        if task and task.wait then
+            task.wait(0)
+        end
+        prompt:InputHoldEnd()
+    end)
+    return fired or ok
+end
+
+local function runPetAuto(now)
+    if petSelectionCount() == 0 then
+        if now - petState.lastStatus > 1 then
+            petState.lastStatus = now
+            setStatus("Select the target pet")
+        end
+        return
+    end
+
+    if (not petState.target) or (not petState.target.Parent) or (not petState.prompt) or (not petState.prompt.Parent) or now - petState.lastScan >= petState.scanInterval then
+        petState.lastScan = now
+        local targets = scanPetTargets()
+        local target = targets[1]
+        petState.target = target and target.model or nil
+        petState.prompt = target and target.prompt or nil
+        petState.targetInfo = target and target.info or nil
+    end
+
+    if not petState.target or not petState.prompt then
+        if now - petState.lastStatus > 1 then
+            petState.lastStatus = now
+            setStatus("No selected pets found")
+        end
+        return
+    end
+
+    if now - petState.lastMove >= petState.moveInterval then
+        petState.lastMove = now
+        local root = getCharacterRoot()
+        local pivot = getPromptCFrame(petState.prompt, petState.target)
+        if root and pivot then
+            local behind = pivot.Position - pivot.LookVector * petState.behindDistance
+            root.CFrame = CFrame.lookAt(behind, pivot.Position)
+        end
+    end
+
+    if now - petState.lastPrompt >= petState.promptInterval then
+        petState.lastPrompt = now
+        local fired = firePetPrompt(petState.prompt)
+        if now - petState.lastStatus > 0.8 then
+            petState.lastStatus = now
+            local info = petState.targetInfo
+            setStatus((fired and "Prompt fired: " or "Prompt attempt: ") .. (info and info.name or petState.target.Name) .. " [" .. (info and info.rarity or "?") .. "]")
+        end
+    end
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "GrowItShopHelper"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(540, 470)
+main.Position = UDim2.new(0.5, -270, 0.5, -235)
+main.BackgroundColor3 = Color3.fromRGB(21, 25, 34)
+main.BorderSizePixel = 0
+main.Parent = gui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(80, 97, 125)
+mainStroke.Thickness = 1
+mainStroke.Parent = main
+
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 52)
+header.BackgroundColor3 = Color3.fromRGB(31, 38, 51)
+header.BorderSizePixel = 0
+header.Parent = main
+
+local headerCorner = Instance.new("UICorner")
+headerCorner.CornerRadius = UDim.new(0, 10)
+headerCorner.Parent = header
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, -286, 1, 0)
+title.Position = UDim2.fromOffset(16, 0)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.Text = "Grow It Shop UI"
+title.TextColor3 = Color3.fromRGB(246, 249, 255)
+title.TextSize = 22
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+
+local buyAllButton = Instance.new("TextButton")
+buyAllButton.Name = "BuyAll"
+buyAllButton.Size = UDim2.fromOffset(92, 32)
+buyAllButton.Position = UDim2.new(1, -258, 0, 10)
+buyAllButton.BackgroundColor3 = Color3.fromRGB(88, 96, 112)
+buyAllButton.BorderSizePixel = 0
+buyAllButton.Font = Enum.Font.GothamBold
+buyAllButton.Text = "All: OFF"
+buyAllButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+buyAllButton.TextSize = 13
+buyAllButton.Parent = header
+
+local buyAllCorner = Instance.new("UICorner")
+buyAllCorner.CornerRadius = UDim.new(0, 7)
+buyAllCorner.Parent = buyAllButton
+rowRefs.BuyAllButton = buyAllButton
+
+local refreshButton = Instance.new("TextButton")
+refreshButton.Name = "Refresh"
+refreshButton.Size = UDim2.fromOffset(82, 32)
+refreshButton.Position = UDim2.new(1, -162, 0, 10)
+refreshButton.BackgroundColor3 = Color3.fromRGB(46, 138, 88)
+refreshButton.BorderSizePixel = 0
+refreshButton.Font = Enum.Font.GothamBold
+refreshButton.Text = "Refresh"
+refreshButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshButton.TextSize = 14
+refreshButton.Parent = header
+
+local refreshCorner = Instance.new("UICorner")
+refreshCorner.CornerRadius = UDim.new(0, 7)
+refreshCorner.Parent = refreshButton
+
+local collapseButton = Instance.new("TextButton")
+collapseButton.Name = "Collapse"
+collapseButton.Size = UDim2.fromOffset(32, 32)
+collapseButton.Position = UDim2.new(1, -74, 0, 10)
+collapseButton.BackgroundColor3 = Color3.fromRGB(73, 88, 116)
+collapseButton.BorderSizePixel = 0
+collapseButton.Font = Enum.Font.GothamBold
+collapseButton.Text = "-"
+collapseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+collapseButton.TextSize = 20
+collapseButton.Parent = header
+
+local collapseCorner = Instance.new("UICorner")
+collapseCorner.CornerRadius = UDim.new(0, 7)
+collapseCorner.Parent = collapseButton
+
+local closeButton = Instance.new("TextButton")
+closeButton.Name = "Close"
+closeButton.Size = UDim2.fromOffset(32, 32)
+closeButton.Position = UDim2.new(1, -38, 0, 10)
+closeButton.BackgroundColor3 = Color3.fromRGB(181, 55, 62)
+closeButton.BorderSizePixel = 0
+closeButton.Font = Enum.Font.GothamBold
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.TextSize = 18
+closeButton.Parent = header
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 7)
+closeCorner.Parent = closeButton
+
+local tabs = Instance.new("Frame")
+tabs.Name = "Tabs"
+tabs.Size = UDim2.new(1, -24, 0, 42)
+tabs.Position = UDim2.fromOffset(12, 62)
+tabs.BackgroundTransparency = 1
+tabs.Parent = main
+
+local tabsLayout = Instance.new("UIListLayout")
+tabsLayout.FillDirection = Enum.FillDirection.Horizontal
+tabsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabsLayout.Padding = UDim.new(0, 8)
+tabsLayout.Parent = tabs
+
+local content = Instance.new("ScrollingFrame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -24, 1, -154)
+content.Position = UDim2.fromOffset(12, 112)
+content.BackgroundColor3 = Color3.fromRGB(17, 21, 30)
+content.BorderSizePixel = 0
+content.ScrollBarThickness = 6
+content.CanvasSize = UDim2.fromOffset(0, 0)
+content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+content.Parent = main
+
+local contentCorner = Instance.new("UICorner")
+contentCorner.CornerRadius = UDim.new(0, 8)
+contentCorner.Parent = content
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Padding = UDim.new(0, 8)
+contentLayout.Parent = content
+
+local contentPadding = Instance.new("UIPadding")
+contentPadding.PaddingTop = UDim.new(0, 10)
+contentPadding.PaddingBottom = UDim.new(0, 10)
+contentPadding.PaddingLeft = UDim.new(0, 10)
+contentPadding.PaddingRight = UDim.new(0, 10)
+contentPadding.Parent = content
+
+local footer = Instance.new("TextLabel")
+footer.Name = "Status"
+footer.Size = UDim2.new(1, -24, 0, 30)
+footer.Position = UDim2.new(0, 12, 1, -36)
+footer.BackgroundTransparency = 1
+footer.Font = Enum.Font.Gotham
+footer.Text = statusText
+footer.TextColor3 = Color3.fromRGB(174, 190, 214)
+footer.TextSize = 13
+footer.TextXAlignment = Enum.TextXAlignment.Left
+footer.TextTruncate = Enum.TextTruncate.AtEnd
+footer.Parent = main
+rowRefs.StatusLabel = footer
+
+local tabButtons = {}
+
+local function setButtonActive(button, active, accent)
+    button.BackgroundColor3 = active and accent or Color3.fromRGB(35, 43, 59)
+    button.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(185, 198, 218)
+end
+
+local function updateBuyAllButton()
+    local button = rowRefs.BuyAllButton
+    if not button then
+        return
+    end
+
+    local enabled = buyAllFlags[activeTab] == true
+    if activeTab == "Pets" then
+        button.Text = enabled and "Pets: ON" or "Pets: OFF"
+    else
+        button.Text = enabled and "All: ON" or "All: OFF"
+    end
+    button.BackgroundColor3 = enabled and shops[activeTab].accent or Color3.fromRGB(88, 96, 112)
+end
+
+local function makeToggle(parent, key, label, callback)
+    local button = Instance.new("TextButton")
+    button.Name = "Toggle_" .. label:gsub("%W", "")
+    button.Size = UDim2.fromOffset(76, 30)
+    button.BackgroundColor3 = autoFlags[key] and Color3.fromRGB(58, 156, 94) or Color3.fromRGB(88, 96, 112)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamBold
+    button.Text = autoFlags[key] and "ON" or "OFF"
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.TextSize = 13
+    button.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = button
+
+    button.MouseButton1Click:Connect(function()
+        autoFlags[key] = not autoFlags[key]
+        button.BackgroundColor3 = autoFlags[key] and Color3.fromRGB(58, 156, 94) or Color3.fromRGB(88, 96, 112)
+        button.Text = autoFlags[key] and "ON" or "OFF"
+        if callback then
+            callback(autoFlags[key])
+        end
+        saveConfig()
+    end)
+
+    return button
+end
+
+local function makeRow(shopKey, info, index)
+    local shop = shops[shopKey]
+    local key = shopKey .. "::" .. info.name
+
+    local row = Instance.new("Frame")
+    row.Name = "Row_" .. tostring(index)
+    row.Size = UDim2.new(1, -4, 0, shopKey == "MoonShop" and 84 or 68)
+    row.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+    row.BorderSizePixel = 0
+    row.LayoutOrder = index
+    row.Parent = content
+
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 8)
+    rowCorner.Parent = row
+
+    local accent = Instance.new("Frame")
+    accent.Name = "Accent"
+    accent.Size = UDim2.new(0, 4, 1, 0)
+    accent.BackgroundColor3 = shop.accent
+    accent.BorderSizePixel = 0
+    accent.Parent = row
+
+    local name = Instance.new("TextLabel")
+    name.Name = "Name"
+    name.Size = UDim2.new(1, -116, 0, 24)
+    name.Position = UDim2.fromOffset(14, 8)
+    name.BackgroundTransparency = 1
+    name.Font = Enum.Font.GothamBold
+    name.Text = info.name
+    name.TextColor3 = Color3.fromRGB(248, 250, 255)
+    name.TextSize = 17
+    name.TextXAlignment = Enum.TextXAlignment.Left
+    name.TextTruncate = Enum.TextTruncate.AtEnd
+    name.Parent = row
+
+    local details = Instance.new("TextLabel")
+    details.Name = "Details"
+    details.Size = UDim2.new(1, -116, 0, 21)
+    details.Position = UDim2.fromOffset(14, 34)
+    details.BackgroundTransparency = 1
+    details.Font = Enum.Font.GothamSemibold
+    details.Text = string.format("%s  |  %s  |  %s", info.stock ~= "" and info.stock or "Server stock check", info.price ~= "" and info.price or "Price ?", info.rarity ~= "" and info.rarity or "Item")
+    details.TextColor3 = inStock(info.stock) and Color3.fromRGB(115, 255, 127) or Color3.fromRGB(255, 119, 111)
+    details.TextSize = 13
+    details.TextXAlignment = Enum.TextXAlignment.Left
+    details.TextTruncate = Enum.TextTruncate.AtEnd
+    details.Parent = row
+
+    if shopKey == "MoonShop" then
+        local note = Instance.new("TextLabel")
+        note.Name = "Note"
+        note.Size = UDim2.new(1, -116, 0, 18)
+        note.Position = UDim2.fromOffset(14, 56)
+        note.BackgroundTransparency = 1
+        note.Font = Enum.Font.Gotham
+        note.Text = "Category: " .. (info.category ~= "" and info.category or "Auto detect")
+        note.TextColor3 = Color3.fromRGB(158, 176, 205)
+        note.TextSize = 12
+        note.TextXAlignment = Enum.TextXAlignment.Left
+        note.Parent = row
+    end
+
+    makeToggle(row, key, "Auto", function(enabled)
+        setStatus((enabled and "Auto enabled: " or "Auto disabled: ") .. info.name)
+    end).Position = UDim2.new(1, -88, 0.5, -15)
+end
+
+local render
+
+local function renderPetSection()
+    updateBuyAllButton()
+
+    local catalog = readPetCatalog()
+    local selectedCount = petSelectionCount()
+
+    local top = Instance.new("Frame")
+    top.Name = "PetControls"
+    top.Size = UDim2.new(1, -4, 0, petState.dropdownOpen and 58 + (#catalog.list * 36) or 78)
+    top.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+    top.BorderSizePixel = 0
+    top.LayoutOrder = 1
+    top.Parent = content
+
+    local topCorner = Instance.new("UICorner")
+    topCorner.CornerRadius = UDim.new(0, 8)
+    topCorner.Parent = top
+
+    local accent = Instance.new("Frame")
+    accent.Name = "Accent"
+    accent.Size = UDim2.new(0, 4, 1, 0)
+    accent.BackgroundColor3 = shops.Pets.accent
+    accent.BorderSizePixel = 0
+    accent.Parent = top
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.Size = UDim2.new(1, -186, 0, 24)
+    label.Position = UDim2.fromOffset(14, 10)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.Text = "Target Pet"
+    label.TextColor3 = Color3.fromRGB(248, 250, 255)
+    label.TextSize = 17
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = top
+
+    local summary = Instance.new("TextLabel")
+    summary.Name = "Summary"
+    summary.Size = UDim2.new(1, -186, 0, 22)
+    summary.Position = UDim2.fromOffset(14, 36)
+    summary.BackgroundTransparency = 1
+    summary.Font = Enum.Font.GothamSemibold
+    summary.Text = string.format("%d selected  |  %d pets in Models.Pets", selectedCount, #catalog.list)
+    summary.TextColor3 = selectedCount > 0 and Color3.fromRGB(115, 255, 127) or Color3.fromRGB(255, 184, 103)
+    summary.TextSize = 13
+    summary.TextXAlignment = Enum.TextXAlignment.Left
+    summary.Parent = top
+
+    local dropdown = Instance.new("TextButton")
+    dropdown.Name = "RarityDropdown"
+    dropdown.Size = UDim2.fromOffset(150, 32)
+    dropdown.Position = UDim2.new(1, -162, 0, 14)
+    dropdown.BackgroundColor3 = petState.dropdownOpen and shops.Pets.accent or Color3.fromRGB(88, 96, 112)
+    dropdown.BorderSizePixel = 0
+    dropdown.Font = Enum.Font.GothamBold
+    dropdown.Text = petState.dropdownOpen and "Close" or "Select"
+    dropdown.TextColor3 = Color3.fromRGB(255, 255, 255)
+    dropdown.TextSize = 14
+    dropdown.Parent = top
+
+    local dropdownCorner = Instance.new("UICorner")
+    dropdownCorner.CornerRadius = UDim.new(0, 7)
+    dropdownCorner.Parent = dropdown
+
+    dropdown.MouseButton1Click:Connect(function()
+        petState.dropdownOpen = not petState.dropdownOpen
+        saveConfig()
+        render()
+    end)
+
+    if petState.dropdownOpen then
+        for index, info in ipairs(catalog.list) do
+            local key = info.name
+            local option = Instance.new("TextButton")
+            option.Name = "Pet_" .. key:gsub("%W", "")
+            option.Size = UDim2.new(1, -28, 0, 30)
+            option.Position = UDim2.fromOffset(14, 54 + ((index - 1) * 36))
+            option.BackgroundColor3 = petState.selectedPets[key] and shops.Pets.accent or Color3.fromRGB(43, 51, 68)
+            option.BorderSizePixel = 0
+            option.Font = Enum.Font.GothamBold
+            option.Text = (petState.selectedPets[key] and "ON  " or "OFF  ") .. key .. "  [" .. info.rarity .. "]"
+            option.TextColor3 = Color3.fromRGB(255, 255, 255)
+            option.TextSize = 14
+            option.TextXAlignment = Enum.TextXAlignment.Left
+            option.TextTruncate = Enum.TextTruncate.AtEnd
+            option.Parent = top
+
+            local optionPadding = Instance.new("UIPadding")
+            optionPadding.PaddingLeft = UDim.new(0, 12)
+            optionPadding.Parent = option
+
+            local optionCorner = Instance.new("UICorner")
+            optionCorner.CornerRadius = UDim.new(0, 7)
+            optionCorner.Parent = option
+
+            option.MouseButton1Click:Connect(function()
+                setPetSelected(key, not petState.selectedPets[key])
+                saveConfig()
+                render()
+            end)
+        end
+    end
+
+    for index, info in ipairs(catalog.list) do
+        local selected = petState.selectedPets[info.name] == true
+        local row = Instance.new("Frame")
+        row.Name = "PetRow_" .. info.name:gsub("%W", "")
+        row.Size = UDim2.new(1, -4, 0, 54)
+        row.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+        row.BorderSizePixel = 0
+        row.LayoutOrder = 20 + index
+        row.Parent = content
+
+        local rowCorner = Instance.new("UICorner")
+        rowCorner.CornerRadius = UDim.new(0, 8)
+        rowCorner.Parent = row
+
+        local rowAccent = Instance.new("Frame")
+        rowAccent.Size = UDim2.new(0, 4, 1, 0)
+        rowAccent.BackgroundColor3 = selected and shops.Pets.accent or Color3.fromRGB(88, 96, 112)
+        rowAccent.BorderSizePixel = 0
+        rowAccent.Parent = row
+
+        local rarityName = Instance.new("TextLabel")
+        rarityName.Size = UDim2.new(1, -112, 0, 24)
+        rarityName.Position = UDim2.fromOffset(14, 7)
+        rarityName.BackgroundTransparency = 1
+        rarityName.Font = Enum.Font.GothamBold
+        rarityName.Text = info.name
+        rarityName.TextColor3 = Color3.fromRGB(248, 250, 255)
+        rarityName.TextSize = 16
+        rarityName.TextXAlignment = Enum.TextXAlignment.Left
+        rarityName.TextTruncate = Enum.TextTruncate.AtEnd
+        rarityName.Parent = row
+
+        local rarityDetail = Instance.new("TextLabel")
+        rarityDetail.Size = UDim2.new(1, -112, 0, 18)
+        rarityDetail.Position = UDim2.fromOffset(14, 30)
+        rarityDetail.BackgroundTransparency = 1
+        rarityDetail.Font = Enum.Font.GothamSemibold
+        rarityDetail.Text = info.rarity
+        rarityDetail.TextColor3 = selected and Color3.fromRGB(115, 255, 127) or Color3.fromRGB(158, 176, 205)
+        rarityDetail.TextSize = 12
+        rarityDetail.TextXAlignment = Enum.TextXAlignment.Left
+        rarityDetail.Parent = row
+
+        autoFlags["PET::" .. info.name] = selected
+        makeToggle(row, "PET::" .. info.name, "Auto", function(enabled)
+            setPetSelected(info.name, enabled)
+            setStatus((enabled and "Selected pet: " or "Removed pet: ") .. info.name)
+            render()
+        end).Position = UDim2.new(1, -88, 0.5, -15)
+    end
+
+    if #catalog.list == 0 then
+        local empty = Instance.new("TextLabel")
+        empty.Name = "NoPets"
+        empty.Size = UDim2.new(1, -4, 0, 84)
+        empty.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+        empty.BorderSizePixel = 0
+        empty.Font = Enum.Font.GothamSemibold
+        empty.Text = "No target pet found in ReplicatedStorage.Models.Pets"
+        empty.TextColor3 = Color3.fromRGB(210, 221, 240)
+        empty.TextSize = 15
+        empty.TextWrapped = true
+        empty.LayoutOrder = 20
+        empty.Parent = content
+
+        local emptyCorner = Instance.new("UICorner")
+        emptyCorner.CornerRadius = UDim.new(0, 8)
+        emptyCorner.Parent = empty
+    end
+
+    setStatus(string.format("Pets: %d total, %d selected", #catalog.list, selectedCount))
+end
+
+local function clearContent()
+    for _, child in ipairs(content:GetChildren()) do
+        if child:IsA("GuiObject") then
+            child:Destroy()
+        end
+    end
+end
+
+function render()
+    if isCollapsed then
+        return
+    end
+
+    clearContent()
+
+    for key, button in pairs(tabButtons) do
+        setButtonActive(button, key == activeTab, shops[key].accent)
+    end
+    updateBuyAllButton()
+
+    if activeTab == "Pets" then
+        renderPetSection()
+        return
+    end
+
+    local cards = scanShop(activeTab)
+    if #cards == 0 then
+        local empty = Instance.new("TextLabel")
+        empty.Name = "Empty"
+        empty.Size = UDim2.new(1, -4, 0, 84)
+        empty.BackgroundColor3 = Color3.fromRGB(28, 34, 47)
+        empty.BorderSizePixel = 0
+        empty.Font = Enum.Font.GothamSemibold
+        empty.Text = "No items found for this shop. Press Refresh or rejoin after the game data loads."
+        empty.TextColor3 = Color3.fromRGB(210, 221, 240)
+        empty.TextSize = 15
+        empty.TextWrapped = true
+        empty.Parent = content
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = empty
+
+        setStatus("No cards found for " .. shops[activeTab].title)
+        return
+    end
+
+    for index, info in ipairs(cards) do
+        makeRow(activeTab, info, index)
+    end
+
+    setStatus(string.format("%s: %d items loaded", shops[activeTab].title, #cards))
+    print(string.format("[GrowItShopHelper] %s loaded %d items", shops[activeTab].title, #cards))
+end
+
+local function applyCollapsed()
+    main.Size = isCollapsed and UDim2.fromOffset(540, 52) or UDim2.fromOffset(540, 470)
+    tabs.Visible = not isCollapsed
+    content.Visible = not isCollapsed
+    footer.Visible = not isCollapsed
+    buyAllButton.Visible = not isCollapsed
+    refreshButton.Visible = not isCollapsed
+    collapseButton.Text = isCollapsed and "+" or "-"
+
+    if not isCollapsed then
+        render()
+    end
+end
+
+for order, key in ipairs({ "Cave", "MoonSeeds", "MoonShop", "Pets" }) do
+    local shop = shops[key]
+    local button = Instance.new("TextButton")
+    button.Name = "Tab_" .. key
+    button.Size = UDim2.new(0, 0, 1, 0)
+    button.AutomaticSize = Enum.AutomaticSize.X
+    button.LayoutOrder = order
+    button.BackgroundColor3 = Color3.fromRGB(35, 43, 59)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamBold
+    button.Text = "  " .. shop.title .. "  "
+    button.TextColor3 = Color3.fromRGB(185, 198, 218)
+    button.TextSize = 14
+    button.Parent = tabs
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = button
+
+    button.MouseButton1Click:Connect(function()
+        activeTab = key
+        saveConfig()
+        render()
+    end)
+
+    tabButtons[key] = button
+end
+
+buyAllButton.MouseButton1Click:Connect(function()
+    if activeTab == "Pets" then
+        if buyAllFlags.Pets then
+            buyAllFlags.Pets = false
+            petState.selectedPets = {}
+            petState.target = nil
+            petState.prompt = nil
+            petState.targetInfo = nil
+            for key in pairs(autoFlags) do
+                if key:find("^PET::") then
+                    autoFlags[key] = false
+                end
+            end
+            setStatus("Pet auto disabled")
+            saveConfig()
+            render()
+            return
+        end
+
+        if petSelectionCount() > 0 then
+            buyAllFlags.Pets = true
+            setStatus("Pet auto enabled")
+            saveConfig()
+        else
+            setStatus("Select the target pet")
+        end
+        updateBuyAllButton()
+        return
+    end
+
+    buyAllFlags[activeTab] = not buyAllFlags[activeTab]
+    updateBuyAllButton()
+    setStatus((buyAllFlags[activeTab] and "Buy All enabled: " or "Buy All disabled: ") .. shops[activeTab].title)
+    saveConfig()
+end)
+
+collapseButton.MouseButton1Click:Connect(function()
+    isCollapsed = not isCollapsed
+    saveConfig()
+    applyCollapsed()
+end)
+
+local function refreshCurrentTab()
+    if activeTab == "Pets" then
+        petCatalogCache = nil
+        petState.target = nil
+        petState.prompt = nil
+        petState.targetInfo = nil
+    end
+    render()
+end
+
+refreshButton.MouseButton1Click:Connect(refreshCurrentTab)
+closeButton.MouseButton1Click:Connect(function()
+    saveConfig()
+    gui:Destroy()
+end)
+
+do
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    for shopKey, enabled in pairs(buyAllFlags) do
+        local allKey = "ALL::" .. shopKey
+        if shopKey ~= "Pets" and enabled and (not lastAuto[allKey] or now - lastAuto[allKey] >= autoInterval) then
+            lastAuto[allKey] = now
+            local attempts = 0
+            for _, info in ipairs(scanShop(shopKey)) do
+                if buyItem(shopKey, info.name, true) then
+                    attempts += 1
+                end
+            end
+            if activeTab == shopKey then
+                setStatus(string.format("Buy All running: %s (%d attempts)", shops[shopKey].title, attempts))
+            end
+        end
+    end
+
+    if buyAllFlags.Pets then
+        runPetAuto(now)
+    end
+
+    for key, enabled in pairs(autoFlags) do
+        if enabled and not key:find("^PET::") and (not lastAuto[key] or now - lastAuto[key] >= autoInterval) then
+            lastAuto[key] = now
+            local sep = key:find("::", 1, true)
+            if sep then
+                local shopKey = key:sub(1, sep - 1)
+                local itemName = key:sub(sep + 2)
+                buyItem(shopKey, itemName, true)
+            end
+        end
+    end
+end)
+
+applyCollapsed()
+
+_G.GrowItShopHelper = {
+    Refresh = render,
+    Scan = scanShop,
+    Buy = buyItem,
+    SaveConfig = saveConfig,
+    LoadConfig = function()
+        loadedConfig = loadConfig()
+        applyConfig(loadedConfig)
+        applyCollapsed()
+        return loadedConfig
+    end,
+    Auto = autoFlags,
+    BuyAll = buyAllFlags,
+    Gui = gui,
+    ConfigPath = configPath,
+}
+
+print("[GrowItShopHelper] UI loaded")
