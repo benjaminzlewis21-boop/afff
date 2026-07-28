@@ -70,6 +70,7 @@ local moonTotemWhitelist = {
 }
 local moduleCatalogCache = nil
 local autoFlags = {}
+local priceCache = {}
 local buyAllFlags = {
     Cave = false,
     MoonSeeds = false,
@@ -163,6 +164,21 @@ local function copyBooleanMap(source, allowedKeys)
     return result
 end
 
+local function copyStringMap(source)
+    local result = {}
+    if type(source) ~= "table" then
+        return result
+    end
+
+    for key, value in pairs(source) do
+        if type(key) == "string" and type(value) == "string" and value ~= "" then
+            result[key] = value
+        end
+    end
+
+    return result
+end
+
 local function applyConfig(config)
     if type(config) ~= "table" then
         return
@@ -182,6 +198,13 @@ local function applyConfig(config)
 
     for key, enabled in pairs(copyBooleanMap(config.buyAllFlags, buyAllFlags)) do
         buyAllFlags[key] = enabled
+    end
+
+    for key in pairs(priceCache) do
+        priceCache[key] = nil
+    end
+    for key, value in pairs(copyStringMap(config.priceCache)) do
+        priceCache[key] = value
     end
 
     if petState then
@@ -235,6 +258,7 @@ local function saveConfig()
         petDropdownOpen = petState and petState.dropdownOpen == true or false,
         autoFlags = copyBooleanMap(autoFlags),
         buyAllFlags = copyBooleanMap(buyAllFlags, buyAllFlags),
+        priceCache = copyStringMap(priceCache),
         selectedPets = selectedPets,
     }
 
@@ -252,6 +276,51 @@ local function saveConfig()
     end
 
     return ok
+end
+
+local function makePriceKey(shopKey, itemName)
+    return tostring(shopKey or "") .. "::" .. trim(itemName or "")
+end
+
+local function isKnownPrice(price)
+    local text = trim(price or "")
+    if text == "" then
+        return false
+    end
+
+    local lower = string.lower(text)
+    if lower == "?" or lower == "price ?" or lower == "price?" then
+        return false
+    end
+    if lower:find("server stock", 1, true) then
+        return false
+    end
+
+    return true
+end
+
+local function syncCachedPrice(shopKey, info)
+    if not shopKey or not info or not info.name then
+        return
+    end
+
+    local key = makePriceKey(shopKey, info.name)
+    local price = trim(info.price or "")
+
+    if isKnownPrice(price) then
+        info.price = price
+        if priceCache[key] ~= price then
+            priceCache[key] = price
+            saveConfig()
+        end
+        return
+    end
+
+    local cached = priceCache[key]
+    if isKnownPrice(cached) then
+        info.price = cached
+        info.priceCached = true
+    end
 end
 
 applyConfig(loadedConfig)
@@ -491,17 +560,22 @@ local function readCatalogFromModules()
     return moduleCatalogCache
 end
 
-local function addCatalogItem(list, byName, info, order)
+local function addCatalogItem(list, byName, info, order, shopKey)
     if not info or not info.name or info.name == "" then
         return
     end
+
+    syncCachedPrice(shopKey, info)
 
     local existingInfo = byName[info.name]
     if existingInfo then
         existingInfo.card = existingInfo.card or info.card
         existingInfo.cashBuy = existingInfo.cashBuy or info.cashBuy
         existingInfo.stock = info.stock ~= "" and info.stock or existingInfo.stock
-        existingInfo.price = info.price ~= "" and info.price or existingInfo.price
+        if isKnownPrice(info.price) and (not isKnownPrice(existingInfo.price) or info.source == "Game UI" or existingInfo.priceCached) then
+            existingInfo.price = info.price
+            existingInfo.priceCached = info.priceCached == true
+        end
         existingInfo.rarity = info.rarity ~= "" and info.rarity or existingInfo.rarity
         existingInfo.category = existingInfo.category or info.category
         existingInfo.source = existingInfo.source or info.source
@@ -613,12 +687,12 @@ local function scanShop(shopKey)
         for categoryIndex, category in ipairs(moonShopCategories) do
             selectMoonShopCategory(category)
             for _, info in ipairs(scanVisibleShopCards(shopKey, category, categoryIndex * 100)) do
-                addCatalogItem(cards, byName, info, info.order or (#cards + 1))
+                addCatalogItem(cards, byName, info, info.order or (#cards + 1), shopKey)
             end
         end
     else
         for _, info in ipairs(scanVisibleShopCards(shopKey, nil, 0)) do
-            addCatalogItem(cards, byName, info, info.order or (#cards + 1))
+            addCatalogItem(cards, byName, info, info.order or (#cards + 1), shopKey)
         end
     end
 
@@ -632,13 +706,13 @@ local function scanShop(shopKey)
             source = "Built-in",
         }
         if shouldIncludeShopItem(shopKey, item) then
-            addCatalogItem(cards, byName, item, 1000 + index)
+            addCatalogItem(cards, byName, item, 1000 + index, shopKey)
         end
     end
 
     for index, info in ipairs((readCatalogFromModules()[shopKey]) or {}) do
         if shouldIncludeShopItem(shopKey, info) then
-            addCatalogItem(cards, byName, info, 2000 + index)
+            addCatalogItem(cards, byName, info, 2000 + index, shopKey)
         end
     end
 
@@ -1992,6 +2066,7 @@ _G.GrowItShopHelper = {
     end,
     Auto = autoFlags,
     BuyAll = buyAllFlags,
+    PriceCache = priceCache,
     Gui = gui,
     ConfigPath = configPath,
 }
